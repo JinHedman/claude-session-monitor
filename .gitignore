@@ -1,0 +1,17 @@
+# Rust build artifacts
+backend/target/
+
+# Swift/Xcode build artifacts
+overlay/.build/
+overlay/*.xcodeproj/
+overlay/*.xcworkspace/
+overlay/DerivedData/
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# SQLite
+*.db
+*.db-shm
+*.db-wal
