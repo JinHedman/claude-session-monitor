@@ -7,21 +7,17 @@ struct SessionCardView: View {
     let isExpanded: Bool
     let onToggleExpand: () -> Void
 
-    @State private var claudeTitle: String? = nil
     @State private var isHovered = false
 
     private var hasSubagents: Bool { session.agents.count > 0 }
 
-    /// Use Claude CLI session summary if available, otherwise path basename.
-    /// Shows "~" for the home directory.
+    /// Display name: project folder basename, fall back to session id.
     private var displayName: String {
-        if let title = claudeTitle, !title.isEmpty { return title }
         let path = session.project_path
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         if path == home { return "~" }
         let last = (path as NSString).lastPathComponent
         if !last.isEmpty { return last }
-        // Ultimate fallback
         let name = session.project_name
         return (!name.isEmpty && name != "unknown") ? name : session.session_id
     }
@@ -33,8 +29,6 @@ struct SessionCardView: View {
                 agentList
             }
         }
-        .onAppear { loadClaudeTitle() }
-        .onChange(of: session.session_id) { _ in loadClaudeTitle() }
         .background(
             RoundedRectangle(cornerRadius: 16, style: .continuous)
                 .fill(Color.white.opacity(0.17))
@@ -86,10 +80,19 @@ struct SessionCardView: View {
             Spacer()
 
             HStack(spacing: 6) {
-                // Focus indicator — always visible, brighter on hover
+                // Focus button — click to switch to terminal tab
                 Image(systemName: "arrow.up.forward.app")
                     .font(.system(size: 10, weight: .medium))
                     .foregroundColor(.white.opacity(isHovered ? 0.65 : 0.22))
+                    .contentShape(Rectangle().inset(by: -6))
+                    .onTapGesture {
+                        TerminalFocus.focus(
+                            projectPath: session.project_path,
+                            sessionId: session.session_id,
+                            transcriptPath: session.transcript_path,
+                            tty: session.tty
+                        )
+                    }
 
                 if hasSubagents {
                     Text("\(session.agents.count) \(session.agents.count == 1 ? "agent" : "agents")")
@@ -114,11 +117,19 @@ struct SessionCardView: View {
         .onHover { isHovered = $0 }
         .animation(.easeInOut(duration: 0.15), value: isHovered)
         .onTapGesture {
-            TerminalFocus.focus(projectPath: session.project_path, sessionId: session.session_id)
+            // Tap on card body = expand/collapse (no terminal focus)
             if hasSubagents {
                 withAnimation(.spring(response: 0.3, dampingFraction: 0.72)) {
                     onToggleExpand()
                 }
+            } else {
+                // No agents to expand — focus terminal instead
+                TerminalFocus.focus(
+                    projectPath: session.project_path,
+                    sessionId: session.session_id,
+                    transcriptPath: session.transcript_path,
+                    tty: session.tty
+                )
             }
         }
     }
@@ -133,7 +144,7 @@ struct SessionCardView: View {
 
             VStack(spacing: 5) {
                 ForEach(session.agents) { agent in
-                    AgentRowView(agent: agent, projectPath: session.project_path, sessionId: session.session_id)
+                    AgentRowView(agent: agent, projectPath: session.project_path, sessionId: session.session_id, tty: session.tty)
                 }
             }
             .padding(.horizontal, 12)
@@ -172,75 +183,6 @@ struct SessionCardView: View {
             startPoint: .leading,
             endPoint: .trailing
         )
-    }
-
-    private func loadClaudeTitle() {
-        let projectPath = session.project_path
-        let sessionId = session.session_id
-        DispatchQueue.global(qos: .utility).async {
-            let encodedPath = projectPath.replacingOccurrences(of: "/", with: "-")
-            let home = FileManager.default.homeDirectoryForCurrentUser.path
-            let projectDir = URL(fileURLWithPath: home)
-                .appendingPathComponent(".claude/projects")
-                .appendingPathComponent(encodedPath)
-
-            // 1. Try sessions-index.json (populated after session ends)
-            let indexURL = projectDir.appendingPathComponent("sessions-index.json")
-            if let data = try? Data(contentsOf: indexURL) {
-                struct IndexEntry: Decodable { let sessionId: String; let summary: String? }
-                struct SessionsIndex: Decodable { let entries: [IndexEntry] }
-                if let index = try? JSONDecoder().decode(SessionsIndex.self, from: data),
-                   let summary = index.entries.first(where: { $0.sessionId == sessionId })?.summary,
-                   !summary.isEmpty {
-                    DispatchQueue.main.async { claudeTitle = summary }
-                    return
-                }
-            }
-
-            // 2. Fall back: read first user message from the JSONL transcript
-            let jsonlURL = projectDir.appendingPathComponent("\(sessionId).jsonl")
-            guard let content = try? String(contentsOf: jsonlURL, encoding: .utf8) else { return }
-            struct TranscriptLine: Decodable {
-                let type: String?
-                let message: MessageBody?
-                struct MessageBody: Decodable {
-                    let role: String?
-                    let content: ContentValue?
-                    enum ContentValue: Decodable {
-                        case string(String)
-                        case array([ContentBlock])
-                        struct ContentBlock: Decodable {
-                            let type: String?
-                            let text: String?
-                        }
-                        init(from decoder: Decoder) throws {
-                            let c = try decoder.singleValueContainer()
-                            if let s = try? c.decode(String.self) { self = .string(s); return }
-                            self = .array((try? c.decode([ContentBlock].self)) ?? [])
-                        }
-                        var text: String? {
-                            switch self {
-                            case .string(let s): return s
-                            case .array(let blocks): return blocks.first(where: { $0.type == "text" })?.text
-                            }
-                        }
-                    }
-                }
-            }
-            for line in content.split(separator: "\n", omittingEmptySubsequences: true) {
-                guard let data = line.data(using: .utf8),
-                      let entry = try? JSONDecoder().decode(TranscriptLine.self, from: data),
-                      entry.type == "user",
-                      entry.message?.role == "user",
-                      let text = entry.message?.content?.text,
-                      !text.isEmpty else { continue }
-                // Truncate to first 60 chars, strip newlines
-                let clean = text.components(separatedBy: .newlines).first { !$0.trimmingCharacters(in: .whitespaces).isEmpty } ?? text
-                let truncated = clean.count > 60 ? String(clean.prefix(60)) + "…" : clean
-                DispatchQueue.main.async { claudeTitle = truncated }
-                return
-            }
-        }
     }
 }
 
@@ -296,7 +238,6 @@ struct StatusDotView: View {
         }
         .frame(width: 22, height: 22)
         .onAppear {
-            // Delay slightly so the window is visible before animating
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
                 isPulsing = true
             }
@@ -310,6 +251,7 @@ struct AgentRowView: View {
     let agent: Agent
     let projectPath: String
     let sessionId: String
+    let tty: String
 
     @State private var isHovered = false
 
@@ -349,8 +291,9 @@ struct AgentRowView: View {
         .onHover { isHovered = $0 }
         .animation(.easeInOut(duration: 0.15), value: isHovered)
         .onTapGesture {
-            TerminalFocus.focus(projectPath: projectPath, sessionId: sessionId)
+            TerminalFocus.focus(projectPath: projectPath, sessionId: sessionId, tty: tty)
         }
+
     }
 
     private var agentColor: Color {

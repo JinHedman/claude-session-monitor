@@ -28,7 +28,7 @@ struct OverlayView: View {
                 }
                 Button("Cancel", role: .cancel) {}
             } message: {
-                Text("This removes all session history from the database. The tables are preserved.")
+                Text("This removes all active sessions from the monitor.")
             }
 
             if !isCollapsed {

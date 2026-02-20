@@ -1,6 +1,11 @@
 import AppKit
 import SwiftUI
 
+/// Custom NSPanel that accepts key events in non-activating mode.
+private final class KeyablePanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+}
+
 final class OverlayWindowController: NSWindowController {
 
     /// Shared reference used by FloatingHeaderBar's SwiftUI DragGesture to move the window.
@@ -11,7 +16,7 @@ final class OverlayWindowController: NSWindowController {
     // MARK: - Init
 
     convenience init() {
-        let panel = NSPanel(
+        let panel = KeyablePanel(
             contentRect: .zero,
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
@@ -36,6 +41,7 @@ final class OverlayWindowController: NSWindowController {
         panel.hidesOnDeactivate = false
         panel.isMovableByWindowBackground = false // Header uses SwiftUI DragGesture via overlayWindow
         panel.acceptsMouseMovedEvents = true
+        panel.becomesKeyOnlyIfNeeded = true
     }
 
     // MARK: - Content

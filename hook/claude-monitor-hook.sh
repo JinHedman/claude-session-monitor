@@ -1,142 +1,146 @@
 #!/usr/bin/env bash
-# Claude Session Monitor Hook
+# Claude Session Monitor Hook — file-based IPC
+# Writes JSON session files to ~/.claude/monitor/sessions/
 # Configured in ~/.claude/settings.json
 
 set -uo pipefail
 
-BACKEND_URL="${CLAUDE_MONITOR_URL:-http://localhost:9147}"
-HOOK_TYPE="${CLAUDE_HOOK_TYPE:-unknown}"
+SESSIONS_DIR="$HOME/.claude/monitor/sessions"
+mkdir -p "$SESSIONS_DIR"
 
-# Resolve binary paths relative to this script's location (works after install)
+# Resolve binary paths relative to this script's location
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
-BACKEND_BIN="${CLAUDE_MONITOR_BACKEND_BIN:-$PROJECT_ROOT/backend/target/release/claude-monitor}"
 OVERLAY_BIN="${CLAUDE_MONITOR_OVERLAY_BIN:-$PROJECT_ROOT/overlay/.build/release/ClaudeMonitor}"
 
-# Auto-start backend and overlay if not already running
-ensure_services_running() {
-  if ! lsof -i :9147 -sTCP:LISTEN -t >/dev/null 2>&1; then
-    if [ -x "$BACKEND_BIN" ]; then
-      nohup "$BACKEND_BIN" >> /tmp/claude-monitor-backend.log 2>&1 &
-      sleep 0.3
-    fi
+# Auto-start overlay if not running
+if ! pgrep -xq "ClaudeMonitor" 2>/dev/null; then
+  if [ -x "$OVERLAY_BIN" ]; then
+    nohup "$OVERLAY_BIN" >> /tmp/claude-monitor-overlay.log 2>&1 &
   fi
-
-  if ! pgrep -xq "ClaudeMonitor" 2>/dev/null; then
-    if [ -x "$OVERLAY_BIN" ]; then
-      nohup "$OVERLAY_BIN" >> /tmp/claude-monitor-overlay.log 2>&1 &
-    fi
-  fi
-}
-
-ensure_services_running
-
-# Read stdin (Claude provides JSON event data)
-INPUT=$(cat)
-
-# Extract fields from the JSON input
-SESSION_ID=$(echo "$INPUT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('session_id',''))" 2>/dev/null || echo "")
-CWD=$(echo "$INPUT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('cwd',''))" 2>/dev/null || echo "")
-TOOL_NAME=$(echo "$INPUT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('tool_name',''))" 2>/dev/null || echo "")
-TRANSCRIPT_PATH=$(echo "$INPUT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('transcript_path',''))" 2>/dev/null || echo "")
-MESSAGE=$(echo "$INPUT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('message',''))" 2>/dev/null || echo "")
-NOTIFICATION_TYPE=$(echo "$INPUT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('notification_type',''))" 2>/dev/null || echo "")
-
-if [ -z "$SESSION_ID" ]; then
-  exit 0
 fi
 
-PROJECT_NAME=$(basename "${CWD:-unknown}")
+# Capture the TTY of the parent process (Claude's shell)
+CLAUDE_TTY=""
+_claude_pid=$(ps -p $$ -o ppid= 2>/dev/null | tr -d ' ')
+if [ -n "$_claude_pid" ]; then
+  CLAUDE_TTY=$(ps -p "$_claude_pid" -o tty= 2>/dev/null | tr -d ' ')
+  [ "$CLAUDE_TTY" = "??" ] && CLAUDE_TTY=""
+fi
 
-build_payload() {
-  local event_type="$1"
-  local needs_input="${2:-false}"
-  local agent_name="${3:-main}"
-  local parent_session_id="${4:-}"
+# Read stdin and pipe to python3.
+# hook_event_name comes from the JSON stdin (Claude provides it).
+# CLAUDE_HOOK_TYPE env var is fallback only.
+cat | FALLBACK_HOOK_TYPE="${CLAUDE_HOOK_TYPE:-}" SESSIONS_DIR="$SESSIONS_DIR" CLAUDE_TTY="$CLAUDE_TTY" python3 -c '
+import json, sys, os, time, tempfile, fcntl
 
-  python3 -c "
-import json, sys
-payload = {
-    'event_type': '$event_type',
-    'session_id': '$SESSION_ID',
-    'project_path': '$CWD',
-    'project_name': '$PROJECT_NAME',
-    'agent_name': '$agent_name',
-    'parent_session_id': '$parent_session_id' if '$parent_session_id' else None,
-    'needs_input': '$needs_input' == 'true',
-    'tool_name': '$TOOL_NAME' if '$TOOL_NAME' else None,
-    'transcript_path': '$TRANSCRIPT_PATH' if '$TRANSCRIPT_PATH' else None,
-    'message': '$MESSAGE' if '$MESSAGE' else None,
-}
-print(json.dumps(payload))
-"
-}
+sessions_dir = os.environ["SESSIONS_DIR"]
+fallback_hook_type = os.environ.get("FALLBACK_HOOK_TYPE", "")
 
-send_event() {
-  local payload="$1"
-  curl -s -X POST \
-    -H "Content-Type: application/json" \
-    -d "$payload" \
-    --max-time 2 \
-    "${BACKEND_URL}/api/events" \
-    > /dev/null 2>&1 &
-}
+try:
+    data = json.loads(sys.stdin.read())
+except Exception:
+    sys.exit(0)
 
-case "$HOOK_TYPE" in
-  SessionStart)
-    # Register session as active when it starts/resumes
-    PAYLOAD=$(build_payload "session_start" "false" "main" "")
-    send_event "$PAYLOAD"
-    ;;
-  SessionEnd)
-    # Mark session completed so it's removed from the overlay
-    PAYLOAD=$(build_payload "session_end" "false" "main" "")
-    send_event "$PAYLOAD"
-    ;;
-  UserPromptSubmit)
-    # User submitted a new prompt — set session back to active immediately
-    PAYLOAD=$(build_payload "user_prompt" "false" "main" "")
-    send_event "$PAYLOAD"
-    ;;
-  Stop)
-    # Claude finished a turn — mark idle (stays visible, awaiting next prompt)
-    PAYLOAD=$(build_payload "stop" "false" "main" "")
-    send_event "$PAYLOAD"
-    ;;
-  Notification)
-    # permission_prompt notification type = needs permission; idle_prompt = waiting for input
-    if [ "$NOTIFICATION_TYPE" = "permission_prompt" ] || \
-       echo "$MESSAGE" | grep -qiE "(permission|approve|allow|confirm|unsafe|dangerous|trust|grant)"; then
-      PAYLOAD=$(build_payload "needs_permission" "true" "main" "")
-    else
-      PAYLOAD=$(build_payload "notification" "true" "main" "")
-    fi
-    send_event "$PAYLOAD"
-    ;;
-  SubagentStart)
-    # A subagent was spawned
-    PAYLOAD=$(build_payload "subagent_start" "false" "subagent" "$SESSION_ID")
-    send_event "$PAYLOAD"
-    ;;
-  SubagentStop)
-    # A subagent finished
-    PAYLOAD=$(build_payload "subagent_stop" "false" "subagent" "$SESSION_ID")
-    send_event "$PAYLOAD"
-    ;;
-  PostToolUse)
-    if [ "$TOOL_NAME" = "Task" ]; then
-      # Fallback subagent tracking via PostToolUse (SubagentStart covers this now)
-      PAYLOAD=$(build_payload "task_started" "false" "subagent" "$SESSION_ID")
-      send_event "$PAYLOAD"
-    fi
-    ;;
-  PreToolUse)
-    PAYLOAD=$(build_payload "tool_use" "false" "main" "")
-    send_event "$PAYLOAD"
-    ;;
-  *)
-    exit 0
-    ;;
-esac
+session_id = data.get("session_id", "")
+if not session_id:
+    sys.exit(0)
+
+# Reject path traversal
+if "/" in session_id or "\\" in session_id or session_id.startswith("."):
+    sys.exit(0)
+
+# Use hook_event_name from JSON (preferred), fall back to env var
+hook_type = data.get("hook_event_name", "") or fallback_hook_type
+if not hook_type:
+    sys.exit(0)
+
+# SessionEnd: delete the session file and exit
+if hook_type == "SessionEnd":
+    path = os.path.join(sessions_dir, session_id + ".json")
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    sys.exit(0)
+
+# Detect permission from Notification messages
+is_permission = False
+if hook_type == "Notification":
+    notification_type = data.get("notification_type", "")
+    message = data.get("message", "")
+    if notification_type == "permission_prompt":
+        is_permission = True
+    elif message:
+        keywords = ("permission", "approve", "allow", "confirm", "unsafe", "dangerous", "trust", "grant")
+        if any(kw in message.lower() for kw in keywords):
+            is_permission = True
+
+# File-level lock to prevent concurrent hooks from losing accumulated state
+session_path = os.path.join(sessions_dir, session_id + ".json")
+lock_path = session_path + ".lock"
+lock_fd = open(lock_path, "w")
+try:
+    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+
+    # Read existing session file to preserve accumulated state (agents list)
+    existing = {}
+    try:
+        with open(session_path, "r") as f:
+            existing = json.load(f)
+    except Exception:
+        pass
+
+    # Accumulate agents: preserve across event overwrites
+    agents = existing.get("agents", {})
+    agent_id = data.get("agent_id", "") or data.get("agent_name", "")
+    if hook_type == "SubagentStart" and agent_id:
+        agents[agent_id] = {
+            "agent_id": agent_id,
+            "agent_name": data.get("agent_name", ""),
+            "agent_type": data.get("agent_type", ""),
+            "status": "active",
+            "started_at": time.time(),
+        }
+    elif hook_type == "SubagentStop" and agent_id and agent_id in agents:
+        agents[agent_id]["status"] = "completed"
+        agents[agent_id]["stopped_at"] = time.time()
+
+    event = {
+        "session_id": session_id,
+        "hook_event_name": hook_type,
+        "timestamp": time.time(),
+        "cwd": existing.get("cwd", "") or data.get("cwd", ""),
+        "notification_type": data.get("notification_type", ""),
+        "message": data.get("message", ""),
+        "tool_name": data.get("tool_name", ""),
+        "tool_input": data.get("tool_input", ""),
+        "agent_name": data.get("agent_name", ""),
+        "agent_id": data.get("agent_id", ""),
+        "agent_type": data.get("agent_type", ""),
+        "transcript_path": data.get("transcript_path", "") or existing.get("transcript_path", ""),
+        "user_prompt": data.get("user_prompt", "") or existing.get("user_prompt", ""),
+        "reason": data.get("reason", ""),
+        "is_permission": is_permission,
+        "is_interrupt": data.get("is_interrupt", False),
+        "tty": os.environ.get("CLAUDE_TTY", "") or existing.get("tty", ""),
+        "agents": agents,
+    }
+
+    # Atomic write: unique temp file then rename
+    fd, tmp_path = tempfile.mkstemp(dir=sessions_dir, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(event, f)
+        os.rename(tmp_path, session_path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+finally:
+    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    lock_fd.close()
+'
 
 exit 0

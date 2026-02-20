@@ -8,36 +8,66 @@ enum TerminalFocus {
     private static let iterm2BundleId   = "com.googlecode.iterm2"
     private static let terminalBundleId = "com.apple.Terminal"
 
-    static func focus(projectPath: String, sessionId: String? = nil) {
+    static func focus(projectPath: String, sessionId: String? = nil, transcriptPath: String? = nil, tty: String? = nil) {
         DispatchQueue.global(qos: .userInitiated).async {
-            let tty = findTTY(forPath: projectPath, sessionId: sessionId)
+            // If we already have a TTY from the hook event, skip expensive discovery
+            let resolvedTTY: String?
+            if let knownTTY = tty, !knownTTY.isEmpty {
+                resolvedTTY = knownTTY
+            } else {
+                resolvedTTY = findTTY(forPath: projectPath, sessionId: sessionId, transcriptPath: transcriptPath)
+            }
             DispatchQueue.main.async {
-                doFocus(tty: tty, projectPath: projectPath)
+                doFocus(tty: resolvedTTY, projectPath: projectPath)
             }
         }
     }
 
     private static func doFocus(tty: String?, projectPath: String) {
+        // Try Ghostty first if it's running (most common for users who use it)
+        if isRunning(ghosttyBundleId) {
+            focusGhostty(tty: tty, projectPath: projectPath)
+            return
+        }
         if let tty {
             if isRunning(iterm2BundleId)   && focusiTerm(tty: tty)      { return }
             if isRunning(terminalBundleId) && focusTerminalApp(tty: tty) { return }
         }
-        // Pass tty to Ghostty focus so we can use process-tree matching
-        if isRunning(ghosttyBundleId) { focusGhostty(tty: tty, projectPath: projectPath); return }
         activateAnyTerminal()
     }
 
     // MARK: - TTY discovery
 
-    private static func findTTY(forPath projectPath: String, sessionId: String? = nil) -> String? {
+    private static func findTTY(forPath projectPath: String, sessionId: String? = nil, transcriptPath: String? = nil) -> String? {
         let task = Process()
         task.launchPath = "/bin/bash"
-        // Strategy A: if we have a sessionId, find the claude process that has
-        // ~/.claude/tasks/<sessionId> open — this bypasses the OS CWD mismatch
-        // (Claude tracks project_path internally; its OS cwd stays where it was launched).
-        // Strategy B: fall back to scanning process CWDs.
+        // Strategy A: transcript file → lsof → pid → tty
+        //   Claude keeps the transcript JSONL open during the session.
+        //   This is the most reliable method since we know the exact file.
+        // Strategy B: sessionId → task dir → lsof → pid → tty
+        // Strategy C: scan shell/claude processes by CWD matching
         task.arguments = ["-c", """
-            # Strategy A: sessionId -> task dir -> pid -> tty
+            # Strategy A: transcript file → pid → tty
+            if [ -n "$TRANSCRIPT_PATH" ] && [ -f "$TRANSCRIPT_PATH" ]; then
+                pid=$(lsof "$TRANSCRIPT_PATH" 2>/dev/null | awk 'NR>1 && $4~/[0-9]/{print $2; exit}')
+                if [ -n "$pid" ]; then
+                    tty=$(ps -p "$pid" -o tty= 2>/dev/null | tr -d ' ')
+                    if [ -n "$tty" ] && [ "$tty" != "??" ]; then
+                        printf '%s' "$tty"
+                        exit 0
+                    fi
+                    # Claude's own process might not have a TTY, try its parent
+                    ppid=$(ps -p "$pid" -o ppid= 2>/dev/null | tr -d ' ')
+                    if [ -n "$ppid" ]; then
+                        tty=$(ps -p "$ppid" -o tty= 2>/dev/null | tr -d ' ')
+                        if [ -n "$tty" ] && [ "$tty" != "??" ]; then
+                            printf '%s' "$tty"
+                            exit 0
+                        fi
+                    fi
+                fi
+            fi
+            # Strategy B: sessionId -> task dir -> pid -> tty
             if [ -n "$SESSION_ID" ]; then
                 task_dir="$HOME/.claude/tasks/$SESSION_ID"
                 if [ -d "$task_dir" ]; then
@@ -51,14 +81,14 @@ enum TerminalFocus {
                     fi
                 fi
             fi
-            # Strategy B: scan claude/shell processes for OS CWD match
+            # Strategy C: scan claude/shell processes for OS CWD match
             for pid in \
+                $(pgrep -a -x claude 2>/dev/null) \
                 $(pgrep -a -x bash   2>/dev/null) \
                 $(pgrep -a -x zsh    2>/dev/null) \
                 $(pgrep -a -x fish   2>/dev/null) \
                 $(pgrep -a -x sh     2>/dev/null) \
-                $(pgrep -a -x node   2>/dev/null) \
-                $(pgrep -a -x claude 2>/dev/null); do
+                $(pgrep -a -x node   2>/dev/null); do
                 cwd=$(lsof -p "$pid" 2>/dev/null | awk '$4=="cwd"{print $NF; exit}')
                 if [ "$cwd" = "$TARGET_PATH" ]; then
                     tty=$(ps -p "$pid" -o tty= 2>/dev/null | tr -d ' ')
@@ -73,6 +103,7 @@ enum TerminalFocus {
         var env = ProcessInfo.processInfo.environment
         env["TARGET_PATH"] = projectPath
         env["SESSION_ID"]  = sessionId ?? ""
+        env["TRANSCRIPT_PATH"] = transcriptPath ?? ""
         task.environment = env
         let pipe = Pipe()
         task.standardOutput = pipe
@@ -144,74 +175,27 @@ enum TerminalFocus {
 
         let folderName = (projectPath as NSString).lastPathComponent
 
-        // Strategy 1: Process-tree tab index → click the Nth tab entry in Window menu.
-        // Tab entries appear after "Arrange in Front" in Ghostty's Window menu.
+        // Strategy 1: TTY → process-tree tab index → Cmd+<number> keyboard shortcut
+        // Uses keyboard shortcuts (Cmd+1, Cmd+2, ...) which target visual tab position,
+        // immune to Window menu MRU reordering that caused reversed navigation.
         if let tty,
-           let tabIndex = findGhosttyTabIndex(ghosttyPid: app.processIdentifier, tty: tty) {
+           let tabIndex = findGhosttyTabIndex(ghosttyPid: app.processIdentifier, tty: tty),
+           tabIndex >= 1 && tabIndex <= 9 {
+            app.activate(options: .activateIgnoringOtherApps)
             let script = """
             tell application "System Events"
                 tell process "Ghostty"
-                    try
-                        set windowMenu to menu "Window" of menu bar 1
-                        set tabEntries to {}
-                        set pastArrange to false
-                        repeat with mi in menu items of windowMenu
-                            try
-                                set n to name of mi
-                                if n is "Arrange in Front" then
-                                    set pastArrange to true
-                                else if pastArrange and n is not missing value and n is not "" then
-                                    set end of tabEntries to mi
-                                end if
-                            end try
-                        end repeat
-                        if (count of tabEntries) >= \(tabIndex) then
-                            click item \(tabIndex) of tabEntries
-                            set frontmost to true
-                            return true
-                        end if
-                    end try
+                    keystroke "\(tabIndex)" using command down
                 end tell
             end tell
-            return false
             """
-            if scriptReturnedTrue(script) {
-                app.activate(options: .activateIgnoringOtherApps)
-                return
-            }
+            var error: NSDictionary?
+            NSAppleScript(source: script)?.executeAndReturnError(&error)
+            if error == nil { return }
         }
 
-        // Strategy 2: Search tab entries in Window menu for one containing the folder name.
-        let menuScript = """
-        tell application "System Events"
-            tell process "Ghostty"
-                try
-                    set windowMenu to menu "Window" of menu bar 1
-                    set pastArrange to false
-                    repeat with mi in menu items of windowMenu
-                        try
-                            set n to name of mi
-                            if n is "Arrange in Front" then
-                                set pastArrange to true
-                            else if pastArrange and n contains "\(folderName)" then
-                                click mi
-                                set frontmost to true
-                                return true
-                            end if
-                        end try
-                    end repeat
-                end try
-            end tell
-        end tell
-        return false
-        """
-        if scriptReturnedTrue(menuScript) {
-            app.activate(options: .activateIgnoringOtherApps)
-            return
-        }
-
-        // Strategy 3: AXWindows — each native macOS tab is a separate AXWindow.
-        // Match by AXDocument (CWD file URL) or window title.
+        // Strategy 2: AXWindows — each native macOS tab is a separate AXWindow.
+        // Match by AXDocument (CWD file URL) or window title containing the folder name.
         let pid = app.processIdentifier
         let axApp = AXUIElementCreateApplication(pid)
         var windowsRef: CFTypeRef?
@@ -231,40 +215,46 @@ enum TerminalFocus {
                     best = win
                 }
             }
-            AXUIElementPerformAction(best ?? windows[0], "AXRaise" as CFString)
+            if let target = best {
+                AXUIElementPerformAction(target, "AXRaise" as CFString)
+                app.activate(options: .activateIgnoringOtherApps)
+                return
+            }
         }
 
+        // Fallback: just activate Ghostty
         app.activate(options: .activateIgnoringOtherApps)
     }
 
-    /// Walk Ghostty's child processes (sorted by PID = creation/tab order),
-    /// find the one whose TTY (or grandchild's TTY) matches, return 1-based index.
+    /// Find Ghostty tab index for a given TTY.
+    /// Uses ONLY direct children of Ghostty (one login process per tab).
+    /// Their PID order matches tab creation order, giving reliable Window menu indices.
     private static func findGhosttyTabIndex(ghosttyPid: pid_t, tty: String) -> Int? {
         let task = Process()
         task.launchPath = "/bin/bash"
-        task.arguments = ["-c", """
-            index=1
-            for child_pid in $(pgrep -a -P \(ghosttyPid) 2>/dev/null | sort -n); do
-                child_tty=$(ps -p "$child_pid" -o tty= 2>/dev/null | tr -d ' ')
-                if [ "$child_tty" = "$TARGET_TTY" ] && [ "$child_tty" != "??" ]; then
-                    echo $index; exit 0
-                fi
-                for gc_pid in $(pgrep -a -P "$child_pid" 2>/dev/null | sort -n); do
-                    gc_tty=$(ps -p "$gc_pid" -o tty= 2>/dev/null | tr -d ' ')
-                    if [ "$gc_tty" = "$TARGET_TTY" ] && [ "$gc_tty" != "??" ]; then
-                        echo $index; exit 0
-                    fi
-                    for ggc_pid in $(pgrep -a -P "$gc_pid" 2>/dev/null | sort -n); do
-                        ggc_tty=$(ps -p "$ggc_pid" -o tty= 2>/dev/null | tr -d ' ')
-                        if [ "$ggc_tty" = "$TARGET_TTY" ] && [ "$ggc_tty" != "??" ]; then
-                            echo $index; exit 0
-                        fi
-                    done
-                done
-                index=$((index + 1))
-            done
-            exit 1
-        """]
+        // Only look at direct children — deep descendants have unreliable PID ordering.
+        // Each direct child (login process) has a unique TTY matching one Ghostty tab.
+        // PID order of direct children = tab creation order = Window menu order.
+        let pyScript = """
+        import sys, subprocess
+        ghostty_pid = int(sys.argv[1])
+        target_tty = sys.argv[2]
+        ps = subprocess.run(['ps', '-eo', 'pid,ppid,tty'], capture_output=True, text=True)
+        direct = []
+        for line in ps.stdout.strip().split(chr(10))[1:]:
+            parts = line.split()
+            if len(parts) >= 3:
+                pid, ppid, tty = int(parts[0]), int(parts[1]), parts[2]
+                if ppid == ghostty_pid and tty not in ('??', 'TTY'):
+                    direct.append((pid, tty))
+        direct.sort()
+        ttys = [t for _, t in direct]
+        if target_tty in ttys:
+            print(ttys.index(target_tty) + 1)
+        else:
+            sys.exit(1)
+        """
+        task.arguments = ["-c", "python3 -c '\(pyScript.replacingOccurrences(of: "'", with: "'\\''"))' \(ghosttyPid) \"$TARGET_TTY\""]
         var env = ProcessInfo.processInfo.environment
         env["TARGET_TTY"] = tty
         task.environment = env
@@ -280,7 +270,6 @@ enum TerminalFocus {
     // MARK: - Helpers
 
     /// Returns true only if the AppleScript itself returned `true`.
-    /// An error-free script that found nothing returns `false` via the descriptor.
     private static func scriptReturnedTrue(_ source: String) -> Bool {
         var error: NSDictionary?
         let descriptor = NSAppleScript(source: source)?.executeAndReturnError(&error)

@@ -11,8 +11,9 @@ chmod +x "$HOOK_SCRIPT"
 echo "Installing Claude Session Monitor hook..."
 echo "Hook script: $HOOK_SCRIPT"
 
-# Create ~/.claude dir if needed
+# Create directories
 mkdir -p "$HOME/.claude"
+mkdir -p "$HOME/.claude/monitor/sessions"
 
 # If settings.json doesn't exist, create a minimal one
 if [ ! -f "$SETTINGS_FILE" ]; then
@@ -29,50 +30,55 @@ hook_script = "$HOOK_SCRIPT"
 with open(settings_file, 'r') as f:
     settings = json.load(f)
 
-hook_entry = {
-    "type": "command",
-    "command": f"CLAUDE_HOOK_TYPE=\$CLAUDE_HOOK_TYPE {hook_script}"
-}
-
-# We need to set CLAUDE_HOOK_TYPE differently per hook type
 def make_hook(hook_type):
     return {
         "type": "command",
-        "command": f"CLAUDE_HOOK_TYPE={hook_type} {hook_script}"
+        "command": f"CLAUDE_HOOK_TYPE={hook_type} '{hook_script}'",
+        "async": True
     }
 
 hooks = settings.get("hooks", {})
 
-for hook_type in ["Stop", "Notification", "PostToolUse", "PreToolUse"]:
-    existing = hooks.get(hook_type, [])
-    # Check if our hook is already there
-    already_installed = any(
-        hook_script in entry.get("command", "")
-        for rule in existing
-        for entry in rule.get("hooks", [])
-        if isinstance(rule, dict)
-    )
-    # Also handle if existing is a list of command objects directly
-    if not already_installed:
-        already_installed = any(
-            hook_script in entry.get("command", "")
-            for entry in existing
-            if isinstance(entry, dict) and "command" in entry
-        )
+hook_types = [
+    "SessionStart", "SessionEnd", "UserPromptSubmit",
+    "Stop", "Notification",
+    "SubagentStart", "SubagentStop",
+    "PreToolUse", "PostToolUse", "PostToolUseFailure",
+]
 
-    if not already_installed:
-        # Use the standard hooks format: list of {matcher, hooks: [...]}
-        new_rule = {
-            "matcher": "",
-            "hooks": [make_hook(hook_type)]
-        }
-        if isinstance(existing, list):
-            hooks[hook_type] = existing + [new_rule]
+for hook_type in hook_types:
+    existing = hooks.get(hook_type, [])
+
+    # Remove any existing monitor hooks (to update async/command format)
+    cleaned = []
+    found = False
+    for rule in existing:
+        if isinstance(rule, dict) and "hooks" in rule:
+            new_hooks = [h for h in rule["hooks"] if hook_script not in h.get("command", "")]
+            if len(new_hooks) < len(rule["hooks"]):
+                found = True
+            if new_hooks:
+                rule["hooks"] = new_hooks
+                cleaned.append(rule)
+            # drop empty rules
+        elif isinstance(rule, dict) and "command" in rule:
+            if hook_script not in rule.get("command", ""):
+                cleaned.append(rule)
+            else:
+                found = True
         else:
-            hooks[hook_type] = [new_rule]
-        print(f"  Added {hook_type} hook")
+            cleaned.append(rule)
+
+    # Add fresh hook entry
+    new_rule = {
+        "matcher": "",
+        "hooks": [make_hook(hook_type)]
+    }
+    hooks[hook_type] = cleaned + [new_rule]
+    if found:
+        print(f"  Updated {hook_type} hook")
     else:
-        print(f"  {hook_type} hook already installed, skipping")
+        print(f"  Added {hook_type} hook")
 
 settings["hooks"] = hooks
 
@@ -83,5 +89,6 @@ print(f"\nHooks installed successfully in {settings_file}")
 PYEOF
 
 echo ""
-echo "Done! Start the backend daemon before using:"
-echo "  cd $(dirname "$HOOK_SCRIPT")/../backend && cargo run --release"
+echo "Done! Build and run the overlay:"
+echo "  cd $(dirname "$HOOK_SCRIPT")/../overlay && swift build -c release"
+echo "  .build/release/ClaudeMonitor"
