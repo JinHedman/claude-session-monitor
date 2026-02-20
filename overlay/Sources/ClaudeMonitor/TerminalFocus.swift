@@ -8,9 +8,9 @@ enum TerminalFocus {
     private static let iterm2BundleId   = "com.googlecode.iterm2"
     private static let terminalBundleId = "com.apple.Terminal"
 
-    static func focus(projectPath: String) {
+    static func focus(projectPath: String, sessionId: String? = nil) {
         DispatchQueue.global(qos: .userInitiated).async {
-            let tty = findTTY(forPath: projectPath)
+            let tty = findTTY(forPath: projectPath, sessionId: sessionId)
             DispatchQueue.main.async {
                 doFocus(tty: tty, projectPath: projectPath)
             }
@@ -29,17 +29,36 @@ enum TerminalFocus {
 
     // MARK: - TTY discovery
 
-    private static func findTTY(forPath projectPath: String) -> String? {
+    private static func findTTY(forPath projectPath: String, sessionId: String? = nil) -> String? {
         let task = Process()
         task.launchPath = "/bin/bash"
+        // Strategy A: if we have a sessionId, find the claude process that has
+        // ~/.claude/tasks/<sessionId> open — this bypasses the OS CWD mismatch
+        // (Claude tracks project_path internally; its OS cwd stays where it was launched).
+        // Strategy B: fall back to scanning process CWDs.
         task.arguments = ["-c", """
+            # Strategy A: sessionId -> task dir -> pid -> tty
+            if [ -n "$SESSION_ID" ]; then
+                task_dir="$HOME/.claude/tasks/$SESSION_ID"
+                if [ -d "$task_dir" ]; then
+                    pid=$(lsof "$task_dir" 2>/dev/null | awk 'NR>1 && $5=="DIR" {print $2; exit}')
+                    if [ -n "$pid" ]; then
+                        tty=$(ps -p "$pid" -o tty= 2>/dev/null | tr -d ' ')
+                        if [ -n "$tty" ] && [ "$tty" != "??" ]; then
+                            printf '%s' "$tty"
+                            exit 0
+                        fi
+                    fi
+                fi
+            fi
+            # Strategy B: scan claude/shell processes for OS CWD match
             for pid in \
-                $(pgrep -x bash   2>/dev/null) \
-                $(pgrep -x zsh    2>/dev/null) \
-                $(pgrep -x fish   2>/dev/null) \
-                $(pgrep -x sh     2>/dev/null) \
-                $(pgrep -x node   2>/dev/null) \
-                $(pgrep -x claude 2>/dev/null); do
+                $(pgrep -a -x bash   2>/dev/null) \
+                $(pgrep -a -x zsh    2>/dev/null) \
+                $(pgrep -a -x fish   2>/dev/null) \
+                $(pgrep -a -x sh     2>/dev/null) \
+                $(pgrep -a -x node   2>/dev/null) \
+                $(pgrep -a -x claude 2>/dev/null); do
                 cwd=$(lsof -p "$pid" 2>/dev/null | awk '$4=="cwd"{print $NF; exit}')
                 if [ "$cwd" = "$TARGET_PATH" ]; then
                     tty=$(ps -p "$pid" -o tty= 2>/dev/null | tr -d ' ')
@@ -53,6 +72,7 @@ enum TerminalFocus {
         """]
         var env = ProcessInfo.processInfo.environment
         env["TARGET_PATH"] = projectPath
+        env["SESSION_ID"]  = sessionId ?? ""
         task.environment = env
         let pipe = Pipe()
         task.standardOutput = pipe
@@ -224,16 +244,22 @@ enum TerminalFocus {
         task.launchPath = "/bin/bash"
         task.arguments = ["-c", """
             index=1
-            for child_pid in $(pgrep -P \(ghosttyPid) 2>/dev/null | sort -n); do
+            for child_pid in $(pgrep -a -P \(ghosttyPid) 2>/dev/null | sort -n); do
                 child_tty=$(ps -p "$child_pid" -o tty= 2>/dev/null | tr -d ' ')
                 if [ "$child_tty" = "$TARGET_TTY" ] && [ "$child_tty" != "??" ]; then
                     echo $index; exit 0
                 fi
-                for gc_pid in $(pgrep -P "$child_pid" 2>/dev/null | sort -n); do
+                for gc_pid in $(pgrep -a -P "$child_pid" 2>/dev/null | sort -n); do
                     gc_tty=$(ps -p "$gc_pid" -o tty= 2>/dev/null | tr -d ' ')
                     if [ "$gc_tty" = "$TARGET_TTY" ] && [ "$gc_tty" != "??" ]; then
                         echo $index; exit 0
                     fi
+                    for ggc_pid in $(pgrep -a -P "$gc_pid" 2>/dev/null | sort -n); do
+                        ggc_tty=$(ps -p "$ggc_pid" -o tty= 2>/dev/null | tr -d ' ')
+                        if [ "$ggc_tty" = "$TARGET_TTY" ] && [ "$ggc_tty" != "??" ]; then
+                            echo $index; exit 0
+                        fi
+                    done
                 done
                 index=$((index + 1))
             done

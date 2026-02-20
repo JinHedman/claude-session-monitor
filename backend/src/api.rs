@@ -73,22 +73,23 @@ pub async fn post_event(
 
     // Handle stop: move 'active' sessions to 'idle' so they stay visible in the overlay.
     // Sessions in 'waiting_input' or 'needs_permission' are left untouched.
-    // Sessions only become 'completed' (and are cleaned up) when explicitly cleared by the user.
     if event.event_type == "stop" {
         if let Err(e) = db::mark_active_session_idle(&state.pool, &event.session_id).await {
             warn!("mark_active_session_idle error: {e}");
         }
-        if let Err(e) = db::insert_event(
-            &state.pool,
-            &event.session_id,
-            Some(agent_name),
-            &event.event_type,
-            "{}",
-        )
-        .await
-        {
+        if let Err(e) = db::insert_event(&state.pool, &event.session_id, Some(agent_name), &event.event_type, "{}").await {
             warn!("insert_event error: {e}");
         }
+        state.broadcast_sessions().await;
+        return StatusCode::OK.into_response();
+    }
+
+    // Handle session_end: mark session completed so it's removed from the overlay.
+    if event.event_type == "session_end" {
+        if let Err(e) = db::mark_session_completed(&state.pool, &event.session_id).await {
+            warn!("mark_session_completed error: {e}");
+        }
+        let _ = db::insert_event(&state.pool, &event.session_id, Some(agent_name), &event.event_type, "{}").await;
         state.broadcast_sessions().await;
         return StatusCode::OK.into_response();
     }
@@ -96,6 +97,7 @@ pub async fn post_event(
     let (session_status, agent_status) = match event.event_type.as_str() {
         "notification" if needs_input => ("waiting_input", "waiting_input"),
         "needs_permission" => ("needs_permission", "needs_permission"),
+        "subagent_stop" => ("active", "completed"),
         _ => ("active", "active"),
     };
 

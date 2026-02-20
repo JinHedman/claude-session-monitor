@@ -8,6 +8,7 @@ struct SessionCardView: View {
     let onToggleExpand: () -> Void
 
     @State private var claudeTitle: String? = nil
+    @State private var isHovered = false
 
     private var hasSubagents: Bool { session.agents.count > 0 }
 
@@ -85,6 +86,11 @@ struct SessionCardView: View {
             Spacer()
 
             HStack(spacing: 6) {
+                // Focus indicator — always visible, brighter on hover
+                Image(systemName: "arrow.up.forward.app")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundColor(.white.opacity(isHovered ? 0.65 : 0.22))
+
                 if hasSubagents {
                     Text("\(session.agents.count) \(session.agents.count == 1 ? "agent" : "agents")")
                         .font(.system(size: 10, weight: .medium, design: .rounded))
@@ -102,9 +108,13 @@ struct SessionCardView: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 13)
+        .background(Color.white.opacity(isHovered ? 0.07 : 0))
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
         .contentShape(Rectangle())
+        .onHover { isHovered = $0 }
+        .animation(.easeInOut(duration: 0.15), value: isHovered)
         .onTapGesture {
-            TerminalFocus.focus(projectPath: session.project_path)
+            TerminalFocus.focus(projectPath: session.project_path, sessionId: session.session_id)
             if hasSubagents {
                 withAnimation(.spring(response: 0.3, dampingFraction: 0.72)) {
                     onToggleExpand()
@@ -123,7 +133,7 @@ struct SessionCardView: View {
 
             VStack(spacing: 5) {
                 ForEach(session.agents) { agent in
-                    AgentRowView(agent: agent, projectPath: session.project_path)
+                    AgentRowView(agent: agent, projectPath: session.project_path, sessionId: session.session_id)
                 }
             }
             .padding(.horizontal, 12)
@@ -170,23 +180,65 @@ struct SessionCardView: View {
         DispatchQueue.global(qos: .utility).async {
             let encodedPath = projectPath.replacingOccurrences(of: "/", with: "-")
             let home = FileManager.default.homeDirectoryForCurrentUser.path
-            let indexURL = URL(fileURLWithPath: home)
+            let projectDir = URL(fileURLWithPath: home)
                 .appendingPathComponent(".claude/projects")
                 .appendingPathComponent(encodedPath)
-                .appendingPathComponent("sessions-index.json")
-            guard let data = try? Data(contentsOf: indexURL) else { return }
-            struct IndexEntry: Decodable {
-                let sessionId: String
-                let summary: String?
+
+            // 1. Try sessions-index.json (populated after session ends)
+            let indexURL = projectDir.appendingPathComponent("sessions-index.json")
+            if let data = try? Data(contentsOf: indexURL) {
+                struct IndexEntry: Decodable { let sessionId: String; let summary: String? }
+                struct SessionsIndex: Decodable { let entries: [IndexEntry] }
+                if let index = try? JSONDecoder().decode(SessionsIndex.self, from: data),
+                   let summary = index.entries.first(where: { $0.sessionId == sessionId })?.summary,
+                   !summary.isEmpty {
+                    DispatchQueue.main.async { claudeTitle = summary }
+                    return
+                }
             }
-            struct SessionsIndex: Decodable {
-                let entries: [IndexEntry]
+
+            // 2. Fall back: read first user message from the JSONL transcript
+            let jsonlURL = projectDir.appendingPathComponent("\(sessionId).jsonl")
+            guard let content = try? String(contentsOf: jsonlURL, encoding: .utf8) else { return }
+            struct TranscriptLine: Decodable {
+                let type: String?
+                let message: MessageBody?
+                struct MessageBody: Decodable {
+                    let role: String?
+                    let content: ContentValue?
+                    enum ContentValue: Decodable {
+                        case string(String)
+                        case array([ContentBlock])
+                        struct ContentBlock: Decodable {
+                            let type: String?
+                            let text: String?
+                        }
+                        init(from decoder: Decoder) throws {
+                            let c = try decoder.singleValueContainer()
+                            if let s = try? c.decode(String.self) { self = .string(s); return }
+                            self = .array((try? c.decode([ContentBlock].self)) ?? [])
+                        }
+                        var text: String? {
+                            switch self {
+                            case .string(let s): return s
+                            case .array(let blocks): return blocks.first(where: { $0.type == "text" })?.text
+                            }
+                        }
+                    }
+                }
             }
-            guard let index = try? JSONDecoder().decode(SessionsIndex.self, from: data) else { return }
-            let summary = index.entries.first(where: { $0.sessionId == sessionId })?.summary
-            guard let title = summary, !title.isEmpty else { return }
-            DispatchQueue.main.async {
-                claudeTitle = title
+            for line in content.split(separator: "\n", omittingEmptySubsequences: true) {
+                guard let data = line.data(using: .utf8),
+                      let entry = try? JSONDecoder().decode(TranscriptLine.self, from: data),
+                      entry.type == "user",
+                      entry.message?.role == "user",
+                      let text = entry.message?.content?.text,
+                      !text.isEmpty else { continue }
+                // Truncate to first 60 chars, strip newlines
+                let clean = text.components(separatedBy: .newlines).first { !$0.trimmingCharacters(in: .whitespaces).isEmpty } ?? text
+                let truncated = clean.count > 60 ? String(clean.prefix(60)) + "…" : clean
+                DispatchQueue.main.async { claudeTitle = truncated }
+                return
             }
         }
     }
@@ -257,6 +309,9 @@ struct StatusDotView: View {
 struct AgentRowView: View {
     let agent: Agent
     let projectPath: String
+    let sessionId: String
+
+    @State private var isHovered = false
 
     var body: some View {
         HStack(spacing: 8) {
@@ -272,6 +327,10 @@ struct AgentRowView: View {
 
             Spacer()
 
+            Image(systemName: "arrow.up.forward.app")
+                .font(.system(size: 9, weight: .medium))
+                .foregroundColor(.white.opacity(isHovered ? 0.55 : 0.15))
+
             Text(agent.status.rawValue.replacingOccurrences(of: "_", with: " "))
                 .font(.system(size: 10, weight: .regular))
                 .foregroundColor(.white.opacity(0.38))
@@ -280,15 +339,17 @@ struct AgentRowView: View {
         .padding(.vertical, 7)
         .background(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(Color.white.opacity(0.05))
+                .fill(Color.white.opacity(isHovered ? 0.10 : 0.05))
                 .overlay(
                     RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .stroke(Color.white.opacity(0.07), lineWidth: 1)
+                        .stroke(Color.white.opacity(isHovered ? 0.13 : 0.07), lineWidth: 1)
                 )
         )
         .contentShape(Rectangle())
+        .onHover { isHovered = $0 }
+        .animation(.easeInOut(duration: 0.15), value: isHovered)
         .onTapGesture {
-            TerminalFocus.focus(projectPath: projectPath)
+            TerminalFocus.focus(projectPath: projectPath, sessionId: sessionId)
         }
     }
 
