@@ -1,10 +1,13 @@
 import AppKit
 
 // Single-instance guard: exit if another ClaudeMonitor is already running.
+// Match by bundle identifier (when running as .app) or executable name (bare binary).
+let myPID = ProcessInfo.processInfo.processIdentifier
 let runningInstances = NSWorkspace.shared.runningApplications.filter {
-    $0.bundleIdentifier == nil &&  // CLI apps have no bundle ID
-    $0.processIdentifier != ProcessInfo.processInfo.processIdentifier &&
-    ($0.executableURL?.lastPathComponent == "ClaudeMonitor")
+    $0.processIdentifier != myPID && (
+        $0.bundleIdentifier == "com.jinhedman.claude-monitor" ||
+        $0.executableURL?.lastPathComponent == "ClaudeMonitor"
+    )
 }
 if !runningInstances.isEmpty {
     exit(0)

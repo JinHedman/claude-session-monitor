@@ -12,10 +12,13 @@ mkdir -p "$SESSIONS_DIR"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 OVERLAY_BIN="${CLAUDE_MONITOR_OVERLAY_BIN:-$PROJECT_ROOT/overlay/.build/release/ClaudeMonitor}"
+APP_BUNDLE="$PROJECT_ROOT/build/ClaudeMonitor.app"
 
 # Auto-start overlay if not running
 if ! pgrep -xq "ClaudeMonitor" 2>/dev/null; then
-  if [ -x "$OVERLAY_BIN" ]; then
+  if [ -d "$APP_BUNDLE" ]; then
+    open -a "$APP_BUNDLE" --args >> /tmp/claude-monitor-overlay.log 2>&1
+  elif [ -x "$OVERLAY_BIN" ]; then
     nohup "$OVERLAY_BIN" >> /tmp/claude-monitor-overlay.log 2>&1 &
   fi
 fi

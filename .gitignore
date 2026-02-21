@@ -1,6 +1,9 @@
 # Rust build artifacts
 backend/target/
 
+# App bundle output
+build/
+
 # Swift/Xcode build artifacts
 overlay/.build/
 overlay/*.xcodeproj/
