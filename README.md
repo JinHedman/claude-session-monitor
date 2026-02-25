@@ -1,98 +1,99 @@
 # Claude Session Monitor
 
-A macOS overlay app that shows active Claude CLI sessions in a floating glass panel — like Apple's notification center, with Claude's purple palette.
+A TUI (terminal UI) that runs in a Ghostty tab and shows active Claude CLI sessions in real time.
 
 ## Architecture
 
 ```
-Claude CLI → end hook fires → POST http://localhost:9147/api/events
-                                         ↓
-                                   Rust daemon (axum)
-                                   SQLite ~/.claude-monitor/sessions.db
-                                         ↓ WebSocket broadcast
-                                   Swift overlay (NSPanel)
-                                   Menu bar icon + glass cards
+Claude CLI → hook fires → JSON files → TUI reads & displays
 ```
 
-## Components
-
-| Path | What it does |
-|------|-------------|
-| `hook/` | Shell scripts triggered by Claude hooks |
-| `backend/` | Rust axum daemon, port 9147 |
-| `overlay/` | Swift macOS menu-bar overlay |
+The hook writes one JSON file per session to `~/.claude/monitor/sessions/`. The TUI polls
+that directory and renders a live table of sessions, states, and activity.
 
 ## Quick Start
 
-### 1. Start the backend
+### 1. Install the hook
 
-```bash
-cd backend
-cargo build --release
-./target/release/claude-monitor
-```
-
-Or install as a LaunchAgent so it runs at login:
-```bash
-cp target/release/claude-monitor /usr/local/bin/claude-monitor
-cp com.claude.monitor.plist ~/Library/LaunchAgents/
-launchctl load ~/Library/LaunchAgents/com.claude.monitor.plist
-```
-
-### 2. Install the Claude hook
-
-```bash
-cd hook
-./install-hook.sh
-```
-
-This merges the hook into `~/.claude/settings.json` for these event types:
-- `Stop` — session ended
-- `Notification` — needs user input (green dot)
-- `PostToolUse` — tool used / subagent spawned
-- `PreToolUse` — activity heartbeat
-
-### 3. Build and run the overlay
-
-```bash
-cd overlay
-swift build -c release
-.build/release/ClaudeMonitor
-```
-
-The app lives in the menu bar. Click the icon to show/hide the overlay.
-
-## UI
-
-- **Glass panel** — right side of screen, always on top, blurs content behind it
-- **Session cards** — one per active Claude session
-  - Purple pulsing dot = active
-  - Green solid dot = waiting for your input
-  - Gray dot = completed
-- **Expand/collapse** — click a card to reveal individual subagents
-- **Menu bar icon** — purple `● N` when sessions active, amber when input needed
-
-## Backend API
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/api/events` | Receive hook event |
-| `GET` | `/api/sessions` | List active sessions with agents |
-| `DELETE` | `/api/sessions/:id` | Mark session completed |
-| `GET` | `/health` | Health check |
-| `WS` | `/ws` | Real-time session updates |
-
-## Hook Event Schema
+Add the hook to `~/.claude/settings.json`:
 
 ```json
 {
-  "event_type": "stop | notification | task_started | tool_use",
-  "session_id": "uuid",
-  "project_path": "/path/to/project",
-  "project_name": "my-project",
-  "agent_name": "main",
-  "parent_session_id": null,
-  "needs_input": false,
-  "tool_name": null
+  "hooks": {
+    "PreToolUse":  [{ "hooks": [{ "type": "command", "command": "/path/to/hook/claude-monitor-hook.sh" }] }],
+    "PostToolUse": [{ "hooks": [{ "type": "command", "command": "/path/to/hook/claude-monitor-hook.sh" }] }],
+    "Notification":[{ "hooks": [{ "type": "command", "command": "/path/to/hook/claude-monitor-hook.sh" }] }],
+    "Stop":        [{ "hooks": [{ "type": "command", "command": "/path/to/hook/claude-monitor-hook.sh" }] }]
+  }
 }
+```
+
+### 2. Build and install the TUI
+
+```bash
+cd tui && ./install.sh
+```
+
+This builds the Go binary and installs it to `/usr/local/bin/claude-monitor`.
+
+### 3. Open a Ghostty tab and run
+
+```bash
+claude-monitor
+```
+
+Keep this tab open while working. It updates automatically as Claude sessions start and end.
+
+## UI
+
+The TUI shows a table of active sessions with their state and recent activity.
+
+| Key | Action |
+|-----|--------|
+| `up` / `down` | Navigate sessions |
+| `Enter` / `f` | Focus the selected session's Ghostty tab |
+| `d` | Dismiss an idle session |
+| `q` | Quit |
+
+## Session States
+
+| State | Color | Meaning |
+|-------|-------|---------|
+| active | orange | Claude is running a tool |
+| waiting | green | Claude is waiting for your input |
+| permission | red | Claude needs permission approval |
+| idle | gray | Session is quiet / no recent activity |
+
+## Tab Focusing
+
+Pressing `Enter` or `f` on a session focuses the corresponding Ghostty tab. The TUI
+writes a terminal title escape sequence to the session's TTY at the moment you press
+the key, waits 200 ms for Ghostty to register it, then clicks the matching Window menu
+item.
+
+**Works in both environments:**
+
+- **Direct Ghostty tab** — the hook captures the TTY of the Claude process and stores
+  it in the session JSON. The TUI writes the OSC title directly to that TTY.
+- **Inside tmux** — the hook runs `tmux display-message -p "#{client_tty}"` to find
+  the outer Ghostty terminal's TTY and stores it as `ghostty_tty`. The TUI uses that
+  field so the title reaches Ghostty rather than being intercepted by tmux.
+
+> **Why write at click time?** Claude Code continuously resets the tab title to
+> `⠂ Claude Code` while active. Writing the title at the moment you press `f` (when
+> Claude is typically idle / waiting) means the title persists long enough for the
+> Window menu lookup to succeed.
+
+## Development
+
+Build and run without installing:
+
+```bash
+cd tui && go build -o /tmp/claude-monitor . && /tmp/claude-monitor
+```
+
+Run tests:
+
+```bash
+cd tui && go test ./... -v
 ```

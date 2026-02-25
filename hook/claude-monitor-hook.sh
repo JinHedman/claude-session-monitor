@@ -11,15 +11,15 @@ mkdir -p "$SESSIONS_DIR"
 # Resolve binary paths relative to this script's location
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
-OVERLAY_BIN="${CLAUDE_MONITOR_OVERLAY_BIN:-$PROJECT_ROOT/overlay/.build/release/ClaudeMonitor}"
-APP_BUNDLE="$PROJECT_ROOT/build/ClaudeMonitor.app"
 
-# Auto-start overlay if not running
-if ! pgrep -xq "ClaudeMonitor" 2>/dev/null; then
-  if [ -d "$APP_BUNDLE" ]; then
-    open -a "$APP_BUNDLE" --args >> /tmp/claude-monitor-overlay.log 2>&1
-  elif [ -x "$OVERLAY_BIN" ]; then
-    nohup "$OVERLAY_BIN" >> /tmp/claude-monitor-overlay.log 2>&1 &
+# TUI is user-started: run `claude-monitor` in a dedicated Ghostty tab.
+# Auto-start is disabled. Set CLAUDE_MONITOR_AUTOSTART=1 to open a new Ghostty tab automatically.
+if [ "${CLAUDE_MONITOR_AUTOSTART:-0}" = "1" ]; then
+  if ! pgrep -f "claude-monitor" > /dev/null 2>&1; then
+    osascript -e 'tell application "Ghostty" to activate' \
+              -e 'tell application "System Events" to keystroke "t" using command down' \
+              -e 'tell application "System Events" to keystroke "claude-monitor"' \
+              -e 'tell application "System Events" to key code 36' 2>/dev/null || true
   fi
 fi
 
@@ -109,6 +109,24 @@ try:
         agents[agent_id]["status"] = "completed"
         agents[agent_id]["stopped_at"] = time.time()
 
+    # Resolve the outer Ghostty terminal TTY for write-then-click focusing
+    _tmux = os.environ.get("TMUX", "")
+    _tty = os.environ.get("CLAUDE_TTY", "")
+    _ghostty_tty = ""
+    if _tmux:
+        try:
+            import subprocess as _sp
+            _r = _sp.run(["tmux", "display-message", "-p", "#{client_tty}"],
+                         capture_output=True, text=True, check=False)
+            _outer = _r.stdout.strip()
+            if _outer.startswith("/dev/"):
+                _outer = _outer[len("/dev/"):]
+            _ghostty_tty = _outer
+        except Exception:
+            pass
+    else:
+        _ghostty_tty = _tty
+
     event = {
         "session_id": session_id,
         "hook_event_name": hook_type,
@@ -127,6 +145,7 @@ try:
         "is_permission": is_permission,
         "is_interrupt": data.get("is_interrupt", False),
         "tty": os.environ.get("CLAUDE_TTY", "") or existing.get("tty", ""),
+        "ghostty_tty": _ghostty_tty,
         "agents": agents,
     }
 
@@ -144,6 +163,10 @@ try:
 finally:
     fcntl.flock(lock_fd, fcntl.LOCK_UN)
     lock_fd.close()
+    try:
+        os.unlink(lock_path)
+    except OSError:
+        pass
 '
 
 exit 0
