@@ -64,6 +64,9 @@ func (s *Session) GetStatus() Status {
 	}
 	switch s.HookEventName {
 	case "PreToolUse", "PostToolUse", "UserPromptSubmit":
+		if time.Since(s.Time()) > 30*time.Second {
+			return StatusIdle
+		}
 		return StatusActive
 	case "Notification":
 		if s.NotificationType == "idle_prompt" {

@@ -4,145 +4,163 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
 
 // focusDeps holds injectable dependencies for testability.
 type focusDeps struct {
-	getMenuItems   func() ([]string, error)
-	clickItem      func(name string) error
+	// Strategy 2: single merged osascript search+click
+	focusTab       func(cwdBasename string) error
 	activateApp    func() error
 	writeTitle     func(tty, basename string) error
 	waitAfterWrite time.Duration
+	// Strategy 1: tab index lookup + Cmd+N keystroke
+	getGhosttyPID func() (int, error)
+	sendKeyNToTab func(tabIndex int) error
+	// findTabIndex is injectable for testing; nil means use findGhosttyTabIndexFromPS via real ps
+	findTabIndex func(pid int, tty string) int
 }
 
-// scriptGetMenuItems returns newline-separated Window menu item names.
-const scriptGetMenuItems = `
-tell application "System Events"
-  tell process "Ghostty"
-    set winMenu to menu "Window" of menu bar 1
-    set result to ""
-    repeat with i from 1 to count of menu items of winMenu
-      try
-        set result to result & (name of menu item i of winMenu) & linefeed
-      on error
-        set result to result & "missing value" & linefeed
-      end try
-    end repeat
-    return result
-  end tell
-end tell
-`
-
-// scriptClickMenuItem clicks a named Window menu item.
-const scriptClickMenuItem = `
+// scriptFocusTab finds a Window menu tab matching targetName and clicks it.
+// argv[1] = cwdBasename (e.g. "myproject")
+// Returns "found" if clicked, "not_found" otherwise.
+const scriptFocusTab = `
 on run argv
   set targetName to item 1 of argv
   tell application "Ghostty" to activate
   tell application "System Events"
     tell process "Ghostty"
       set frontmost to true
-      try
-        click menu item targetName of menu "Window" of menu bar 1
-        return "found"
-      end try
+      set winMenu to menu "Window" of menu bar 1
+      -- Pass 1: claude:<targetName> prefix match
+      repeat with i from 1 to count of menu items of winMenu
+        try
+          set n to name of menu item i of winMenu
+          if n contains ("claude:" & targetName) then
+            click menu item i of winMenu
+            return "found"
+          end if
+        end try
+      end repeat
+      -- Pass 2: bare targetName substring match
+      repeat with i from 1 to count of menu items of winMenu
+        try
+          set n to name of menu item i of winMenu
+          if n contains targetName then
+            click menu item i of winMenu
+            return "found"
+          end if
+        end try
+      end repeat
     end tell
   end tell
   return "not_found"
 end run
 `
 
-// systemMenuItems is the set of known Ghostty UI menu items to filter out.
-var systemMenuItems = map[string]bool{
-	"Minimize":                true,
-	"Minimize All":            true,
-	"Zoom":                    true,
-	"Zoom All":                true,
-	"Fill":                    true,
-	"Center":                  true,
-	"Move & Resize":           true,
-	"Full Screen Tile":        true,
-	"Toggle Full Screen":      true,
-	"Show/Hide All Terminals": true,
-	"Show Previous Tab":       true,
-	"Show Next Tab":           true,
-	"Move Tab to New Window":  true,
-	"Merge All Windows":       true,
-	"Zoom Split":              true,
-	"Select Previous Split":   true,
-	"Select Next Split":       true,
-	"Select Split":            true,
-	"Resize Split":            true,
-	"Return To Default Size":  true,
-	"Float on Top":            true,
-	"Use as Default":          true,
-	"Bring All to Front":      true,
-	"Arrange in Front":        true,
-	"Remove Window from Set":  true,
-	"missing value":           true,
-	"":                        true,
-}
+// scriptSendCmdN sends Cmd+<N> to switch to tab N in Ghostty.
+const scriptSendCmdN = `
+on run argv
+  set tabNum to (item 1 of argv) as integer
+  -- macOS key codes for 1-9: 18,19,20,21,23,22,26,28,25
+  set keyCodes to {18, 19, 20, 21, 23, 22, 26, 28, 25}
+  set kc to item tabNum of keyCodes
+  tell application "Ghostty" to activate
+  tell application "System Events"
+    key code kc using command down
+  end tell
+end run
+`
 
-// isSystemMenuItem returns true if the item is a known Ghostty UI element.
-func isSystemMenuItem(name string) bool {
-	return systemMenuItems[name]
-}
-
-// filterTabItems returns only non-system menu items (i.e. actual tabs).
-// TrimRight strips only trailing \r and \n so CRLF osascript output is handled
-// without disturbing any leading whitespace that AppleScript preserves in item names.
-func filterTabItems(items []string) []string {
-	var tabs []string
-	for _, item := range items {
-		item = strings.TrimRight(item, "\r\n")
-		if !isSystemMenuItem(item) {
-			tabs = append(tabs, item)
+// getGhosttyPID returns the PID of the running Ghostty process.
+// pgrep -x doesn't work for macOS GUI apps because ps comm shows the full executable
+// path. We scan ps output instead.
+func getGhosttyPID() (int, error) {
+	out, err := exec.Command("ps", "-eo", "pid,comm").Output()
+	if err != nil {
+		return 0, err
+	}
+	for _, line := range strings.Split(string(out), "\n")[1:] {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 &&
+			strings.Contains(fields[1], "Ghostty.app") &&
+			strings.HasSuffix(fields[1], "/ghostty") {
+			pid, err := strconv.Atoi(fields[0])
+			if err != nil {
+				continue
+			}
+			return pid, nil
 		}
 	}
-	return tabs
+	return 0, fmt.Errorf("Ghostty not running")
 }
 
-// matchTab finds the best-matching tab item for the given cwd basename.
-// Pass 1: item contains "claude:<cwdBasename>".
-// Pass 2: item contains bare cwdBasename.
-// Returns "" if no match.
-func matchTab(tabItems []string, cwdBasename string) string {
-	if cwdBasename == "" {
-		return ""
+// findGhosttyTabIndexFromPS returns the 1-based tab index of tty among direct
+// children of ghosttyPID, determined by sorting child PIDs ascending.
+// psOutput is the raw output of "ps -eo pid,ppid,tty" (passed in for testability).
+// Returns 0 if not found or inputs are invalid.
+func findGhosttyTabIndexFromPS(ghosttyPID int, tty string, psOutput string) int {
+	if tty == "" || ghosttyPID == 0 {
+		return 0
 	}
-	// Pass 1: claude: prefix
-	for _, item := range tabItems {
-		if strings.Contains(item, "claude:"+cwdBasename) {
-			return item
+	// Strip /dev/ prefix for comparison with ps tty field (e.g. "ttys001" → "s001" is NOT right;
+	// ps uses "s001" but the tty string may be "ttys001". Normalise: strip /dev/ then use as-is.
+	bare := strings.TrimPrefix(tty, "/dev/")
+
+	type entry struct {
+		pid int
+		tty string
+	}
+	var direct []entry
+
+	lines := strings.Split(psOutput, "\n")
+	if len(lines) > 0 {
+		lines = lines[1:] // skip header
+	}
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) < 3 {
+			continue
+		}
+		pid, err1 := strconv.Atoi(fields[0])
+		ppid, err2 := strconv.Atoi(fields[1])
+		ttyField := fields[2]
+		if err1 != nil || err2 != nil || ppid != ghosttyPID || ttyField == "??" || ttyField == "TTY" {
+			continue
+		}
+		direct = append(direct, entry{pid, ttyField})
+	}
+	sort.Slice(direct, func(i, j int) bool { return direct[i].pid < direct[j].pid })
+	for i, e := range direct {
+		if e.tty == bare {
+			return i + 1 // 1-based
 		}
 	}
-	// Pass 2: bare folder name
-	for _, item := range tabItems {
-		if strings.Contains(item, cwdBasename) {
-			return item
-		}
+	return 0
+}
+
+// realFindTabIndex runs real ps and calls findGhosttyTabIndexFromPS.
+func realFindTabIndex(pid int, tty string) int {
+	out, err := exec.Command("ps", "-eo", "pid,ppid,tty").Output()
+	if err != nil {
+		return 0
 	}
-	return ""
+	return findGhosttyTabIndexFromPS(pid, tty, string(out))
 }
 
 // realDeps returns production wiring using osascript.
 func realDeps() focusDeps {
 	return focusDeps{
-		getMenuItems: func() ([]string, error) {
-			out, err := runOsascript(scriptGetMenuItems)
-			if err != nil {
-				return nil, err
-			}
-			return strings.Split(out, "\n"), nil
-		},
-		clickItem: func(name string) error {
-			out, err := runOsascript(scriptClickMenuItem, name)
+		focusTab: func(cwdBasename string) error {
+			out, err := runOsascript(scriptFocusTab, cwdBasename)
 			if err != nil {
 				return err
 			}
 			if strings.TrimSpace(out) != "found" {
-				return fmt.Errorf("menu item not found: %s", name)
+				return fmt.Errorf("tab not found: %s", cwdBasename)
 			}
 			return nil
 		},
@@ -166,7 +184,13 @@ func realDeps() focusDeps {
 			_, err = fmt.Fprintf(f, "\033]0;claude:%s\007", basename)
 			return err
 		},
-		waitAfterWrite: 200 * time.Millisecond,
+		waitAfterWrite: 75 * time.Millisecond,
+		getGhosttyPID: getGhosttyPID,
+		sendKeyNToTab: func(tabIndex int) error {
+			_, err := runOsascript(scriptSendCmdN, strconv.Itoa(tabIndex))
+			return err
+		},
+		findTabIndex: realFindTabIndex,
 	}
 }
 
@@ -174,32 +198,34 @@ func realDeps() focusDeps {
 func focusGhosttyTab(deps focusDeps, tty, cwd string) error {
 	cwdBasename := lastPathComponent(cwd)
 
-	// Write the OSC title to the session's TTY right before menu lookup.
-	// At click time, Claude is likely idle and won't immediately override.
+	// Strategy 1: TTY → tab index → Cmd+N (fast path, no sleep needed)
+	if deps.getGhosttyPID != nil && deps.sendKeyNToTab != nil && tty != "" {
+		if pid, err := deps.getGhosttyPID(); err == nil && pid > 0 {
+			var idx int
+			if deps.findTabIndex != nil {
+				idx = deps.findTabIndex(pid, tty)
+			} else {
+				idx = realFindTabIndex(pid, tty)
+			}
+			if idx >= 1 && idx <= 9 {
+				if err := deps.sendKeyNToTab(idx); err == nil {
+					return nil
+				}
+			}
+		}
+	}
+
+	// Strategy 2: write OSC title, wait for Ghostty to process it, then search+click.
 	if tty != "" && cwdBasename != "" && deps.writeTitle != nil {
 		_ = deps.writeTitle(tty, cwdBasename)
 		if deps.waitAfterWrite > 0 {
 			time.Sleep(deps.waitAfterWrite)
 		}
 	}
-
-	items, err := deps.getMenuItems()
-	if err != nil {
+	if err := deps.focusTab(cwdBasename); err != nil {
 		_ = deps.activateApp()
 		return nil
 	}
-
-	tabs := filterTabItems(items)
-	matched := matchTab(tabs, cwdBasename)
-	if matched != "" {
-		if err := deps.clickItem(matched); err != nil {
-			_ = deps.activateApp()
-			return nil
-		}
-		return nil
-	}
-
-	_ = deps.activateApp()
 	return nil
 }
 
