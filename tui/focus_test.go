@@ -4,7 +4,6 @@ package main
 
 import (
 	"errors"
-	"fmt"
 	"testing"
 	"time"
 )
@@ -253,85 +252,6 @@ func TestFindGhosttyTabIndex_MultipleChildren(t *testing.T) {
 	idx := findGhosttyTabIndexFromPS(50, "ttys002", psOutput)
 	if idx != 2 {
 		t.Errorf("want 2, got %d", idx)
-	}
-}
-
-func TestFocusGhosttyTab_Strategy1UsedFirst(t *testing.T) {
-	writeCalled := false
-	focusTabCalled := false
-	keysSent := []int{}
-
-	deps := focusDeps{
-		getGhosttyPID: func() (int, error) { return 1234, nil },
-		findTabIndex:  func(pid int, tty string) int { return 3 },
-		sendKeyNToTab: func(idx int) error { keysSent = append(keysSent, idx); return nil },
-		writeTitle:    func(tty, basename string) error { writeCalled = true; return nil },
-		focusTab:      func(cwdBasename string) error { focusTabCalled = true; return nil },
-		activateApp:   func() error { return nil },
-		waitAfterWrite: 0,
-	}
-	err := focusGhosttyTab(deps, "ttys005", "/Users/filip/myproject")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(keysSent) != 1 || keysSent[0] != 3 {
-		t.Errorf("expected sendKeyNToTab(3), got %v", keysSent)
-	}
-	if writeCalled {
-		t.Error("writeTitle should NOT be called when Strategy 1 succeeds")
-	}
-	if focusTabCalled {
-		t.Error("focusTab should NOT be called when Strategy 1 succeeds")
-	}
-}
-
-func TestFocusGhosttyTab_Strategy1FallsBackToStrategy2(t *testing.T) {
-	writeCalled := false
-	focusTabCalled := false
-
-	deps := focusDeps{
-		getGhosttyPID: func() (int, error) { return 1234, nil },
-		findTabIndex:  func(pid int, tty string) int { return 0 }, // not found
-		sendKeyNToTab: func(idx int) error { t.Error("sendKeyNToTab should not be called"); return nil },
-		writeTitle:    func(tty, basename string) error { writeCalled = true; return nil },
-		focusTab:      func(cwdBasename string) error { focusTabCalled = true; return nil },
-		activateApp:   func() error { return nil },
-		waitAfterWrite: 0,
-	}
-	err := focusGhosttyTab(deps, "ttys005", "/Users/filip/myproject")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !writeCalled {
-		t.Error("writeTitle should be called in Strategy 2 fallback")
-	}
-	if !focusTabCalled {
-		t.Error("focusTab should be called in Strategy 2 fallback")
-	}
-}
-
-func TestFocusGhosttyTab_Strategy1FailsFallsBack(t *testing.T) {
-	writeCalled := false
-	focusTabCalled := false
-
-	deps := focusDeps{
-		getGhosttyPID: func() (int, error) { return 1234, nil },
-		findTabIndex:  func(pid int, tty string) int { return 2 },
-		sendKeyNToTab: func(idx int) error { return fmt.Errorf("osascript failed") },
-		writeTitle:    func(tty, basename string) error { writeCalled = true; return nil },
-		focusTab:      func(cwdBasename string) error { focusTabCalled = true; return nil },
-		activateApp:   func() error { return nil },
-		waitAfterWrite: 0,
-	}
-	err := focusGhosttyTab(deps, "ttys005", "/Users/filip/myproject")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !writeCalled {
-		t.Error("writeTitle should be called when Strategy 1 fails and falls back")
-	}
-	if !focusTabCalled {
-		t.Error("focusTab should be called when Strategy 1 fails and falls back")
 	}
 }
 

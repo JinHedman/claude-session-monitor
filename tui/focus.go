@@ -185,12 +185,10 @@ func realDeps() focusDeps {
 			return err
 		},
 		waitAfterWrite: 75 * time.Millisecond,
-		getGhosttyPID: getGhosttyPID,
-		sendKeyNToTab: func(tabIndex int) error {
-			_, err := runOsascript(scriptSendCmdN, strconv.Itoa(tabIndex))
-			return err
-		},
-		findTabIndex: realFindTabIndex,
+		// getGhosttyPID, sendKeyNToTab, findTabIndex intentionally nil —
+		// Strategy 1 (Cmd+N via PID-sorted tab index) is disabled because
+		// PID creation order ≠ Ghostty visual tab order (TTY device numbers
+		// are recycled by the kernel, making PID sort unreliable for tab position).
 	}
 }
 
@@ -198,24 +196,7 @@ func realDeps() focusDeps {
 func focusGhosttyTab(deps focusDeps, tty, cwd string) error {
 	cwdBasename := lastPathComponent(cwd)
 
-	// Strategy 1: TTY → tab index → Cmd+N (fast path, no sleep needed)
-	if deps.getGhosttyPID != nil && deps.sendKeyNToTab != nil && tty != "" {
-		if pid, err := deps.getGhosttyPID(); err == nil && pid > 0 {
-			var idx int
-			if deps.findTabIndex != nil {
-				idx = deps.findTabIndex(pid, tty)
-			} else {
-				idx = realFindTabIndex(pid, tty)
-			}
-			if idx >= 1 && idx <= 9 {
-				if err := deps.sendKeyNToTab(idx); err == nil {
-					return nil
-				}
-			}
-		}
-	}
-
-	// Strategy 2: write OSC title, wait for Ghostty to process it, then search+click.
+	// Write OSC title so the tab has a searchable name, then search+click via Window menu.
 	if tty != "" && cwdBasename != "" && deps.writeTitle != nil {
 		_ = deps.writeTitle(tty, cwdBasename)
 		if deps.waitAfterWrite > 0 {

@@ -8,12 +8,13 @@ echo "Building claude-monitor..."
 cd "$SCRIPT_DIR"
 go build -o /tmp/claude-monitor .
 
-# macOS 26+ requires explicit ad-hoc codesign (linker-signed alone causes SIGKILL)
-echo "Signing..."
-codesign --force -s - /tmp/claude-monitor
-
 echo "Installing..."
 sudo cp /tmp/claude-monitor /usr/local/bin/claude-monitor
+
+# macOS 26+ requires explicit ad-hoc codesign (linker-signed alone causes SIGKILL).
+# Sign AFTER cp so the signature covers the file at its final path/inode.
+echo "Signing..."
+sudo codesign --force -s - /usr/local/bin/claude-monitor
 
 echo "Installed to /usr/local/bin/claude-monitor"
 echo ""

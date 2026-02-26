@@ -160,6 +160,17 @@ try:
             os.unlink(tmp_path)
         except OSError:
             pass
+
+    # Write OSC title to the outer Ghostty tab so claude-monitor can focus
+    # the correct tab by name. Uses ghostty_tty (outer TTY), not tty (inner
+    # tmux pane TTY), so the title lands on the tab visible in the Window menu.
+    _cwd_basename = os.path.basename(event.get("cwd", "") or "")
+    if _ghostty_tty and _cwd_basename:
+        try:
+            with open("/dev/" + _ghostty_tty, "w") as _t:
+                _t.write("\033]0;claude:" + _cwd_basename + "\007")
+        except Exception:
+            pass
 finally:
     fcntl.flock(lock_fd, fcntl.LOCK_UN)
     lock_fd.close()
