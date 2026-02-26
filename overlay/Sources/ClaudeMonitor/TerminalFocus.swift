@@ -1,5 +1,133 @@
 import AppKit
 
+/// Injectable dependencies for testable Ghostty focus logic.
+struct GhosttyFocusDeps {
+    var writeTitle: (_ tty: String, _ basename: String) -> Void
+    var getMenuItems: () -> [String]
+    var clickItem: (_ name: String) -> Bool
+    var activateApp: () -> Void
+    var waitAfterWrite: TimeInterval
+
+    static func real() -> GhosttyFocusDeps {
+        GhosttyFocusDeps(
+            writeTitle: { tty, basename in
+                let dev = tty.hasPrefix("/dev/") ? tty : "/dev/\(tty)"
+                guard let fh = FileHandle(forWritingAtPath: dev) else { return }
+                let osc = "\u{1B}]0;claude:\(basename)\u{07}"
+                fh.write(osc.data(using: .utf8) ?? Data())
+                fh.closeFile()
+            },
+            getMenuItems: {
+                let script = """
+                tell application "System Events"
+                  tell process "Ghostty"
+                    set winMenu to menu "Window" of menu bar 1
+                    set result to ""
+                    repeat with i from 1 to count of menu items of winMenu
+                      try
+                        set result to result & (name of menu item i of winMenu) & linefeed
+                      on error
+                        set result to result & "missing value" & linefeed
+                      end try
+                    end repeat
+                    return result
+                  end tell
+                end tell
+                """
+                var error: NSDictionary?
+                guard let val = NSAppleScript(source: script)?
+                    .executeAndReturnError(&error).stringValue,
+                      error == nil else { return [] }
+                return val.components(separatedBy: "\n")
+            },
+            clickItem: { name in
+                let safe = name.replacingOccurrences(of: "\"", with: "\\\"")
+                let script = """
+                tell application "Ghostty" to activate
+                tell application "System Events"
+                    tell process "Ghostty"
+                        set frontmost to true
+                        try
+                            click menu item "\(safe)" of menu "Window" of menu bar 1
+                            return true
+                        end try
+                    end tell
+                end tell
+                return false
+                """
+                var error: NSDictionary?
+                let d = NSAppleScript(source: script)?.executeAndReturnError(&error)
+                return error == nil && d?.booleanValue == true
+            },
+            activateApp: {
+                NSWorkspace.shared.runningApplications
+                    .first { $0.bundleIdentifier == "com.mitchellh.ghostty" }?
+                    .activate(options: .activateIgnoringOtherApps)
+            },
+            waitAfterWrite: 0.2
+        )
+    }
+}
+
+// Mirror of tui/focus.go's systemMenuItems — keep in sync
+private let systemMenuItemsSet: Set<String> = [
+    "Minimize", "Minimize All", "Zoom", "Zoom All", "Fill", "Center",
+    "Move & Resize", "Full Screen Tile", "Toggle Full Screen",
+    "Show/Hide All Terminals", "Show Previous Tab", "Show Next Tab",
+    "Move Tab to New Window", "Merge All Windows", "Zoom Split",
+    "Select Previous Split", "Select Next Split", "Select Split",
+    "Resize Split", "Return To Default Size", "Float on Top",
+    "Use as Default", "Bring All to Front", "Arrange in Front",
+    "Remove Window from Set", "missing value", ""
+]
+
+func isSystemMenuItem(_ name: String) -> Bool {
+    systemMenuItemsSet.contains(name)
+}
+
+func filterTabItems(_ items: [String]) -> [String] {
+    items.compactMap { item -> String? in
+        // Strip trailing \r\n only (mirrors TrimRight in Go — preserves leading whitespace)
+        let trimmed = item.trimmingCharacters(in: CharacterSet(charactersIn: "\r\n"))
+        return isSystemMenuItem(trimmed) ? nil : trimmed
+    }
+}
+
+/// Pass 1: item contains "claude:<cwdBasename>".
+/// Pass 2: item contains bare cwdBasename.
+/// Returns nil if no match.
+func matchTab(items: [String], cwdBasename: String) -> String? {
+    guard !cwdBasename.isEmpty else { return nil }
+    if let match = items.first(where: { $0.contains("claude:\(cwdBasename)") }) {
+        return match
+    }
+    return items.first(where: { $0.contains(cwdBasename) })
+}
+
+/// Testable core of Ghostty tab focusing.
+/// Called from TerminalFocus.focusGhostty() with real deps, and from tests with mocks.
+func focusGhosttyWithDeps(_ deps: GhosttyFocusDeps, ghosttyTTY: String, projectPath: String) {
+    let basename = (projectPath as NSString).lastPathComponent
+
+    // Write-then-click: set the OSC title right before querying the menu.
+    // Claude Code overrides the tab title while active; writing at click time
+    // (when the user has just tapped the focus button) means Claude is likely idle.
+    if !ghosttyTTY.isEmpty && !basename.isEmpty {
+        deps.writeTitle(ghosttyTTY, basename)
+        if deps.waitAfterWrite > 0 {
+            Thread.sleep(forTimeInterval: deps.waitAfterWrite)
+        }
+    }
+
+    let items = deps.getMenuItems()
+    let tabs = filterTabItems(items)
+    if let matched = matchTab(items: tabs, cwdBasename: basename) {
+        if deps.clickItem(matched) { return }
+    }
+
+    deps.activateApp()
+}
+
 /// Brings to front the terminal window/tab whose session is running in `projectPath`.
 /// Supports iTerm2, Terminal.app, and Ghostty (including multi-tab).
 enum TerminalFocus {
@@ -8,7 +136,7 @@ enum TerminalFocus {
     private static let iterm2BundleId   = "com.googlecode.iterm2"
     private static let terminalBundleId = "com.apple.Terminal"
 
-    static func focus(projectPath: String, sessionId: String? = nil, transcriptPath: String? = nil, tty: String? = nil) {
+    static func focus(projectPath: String, sessionId: String? = nil, transcriptPath: String? = nil, tty: String? = nil, ghosttyTTY: String? = nil) {
         DispatchQueue.global(qos: .userInitiated).async {
             // If we already have a TTY from the hook event, skip expensive discovery
             let resolvedTTY: String?
@@ -18,15 +146,15 @@ enum TerminalFocus {
                 resolvedTTY = findTTY(forPath: projectPath, sessionId: sessionId, transcriptPath: transcriptPath)
             }
             DispatchQueue.main.async {
-                doFocus(tty: resolvedTTY, projectPath: projectPath)
+                doFocus(tty: resolvedTTY, ghosttyTTY: ghosttyTTY, projectPath: projectPath)
             }
         }
     }
 
-    private static func doFocus(tty: String?, projectPath: String) {
+    private static func doFocus(tty: String?, ghosttyTTY: String?, projectPath: String) {
         // Try Ghostty first if it's running (most common for users who use it)
         if isRunning(ghosttyBundleId) {
-            focusGhostty(tty: tty, projectPath: projectPath)
+            focusGhostty(tty: tty, ghosttyTTY: ghosttyTTY, projectPath: projectPath)
             return
         }
         if let tty {
@@ -169,24 +297,22 @@ enum TerminalFocus {
 
     // MARK: - Ghostty
 
-    private static func focusGhostty(tty: String?, projectPath: String) {
+    private static func focusGhostty(tty: String?, ghosttyTTY: String?, projectPath: String) {
         guard let app = NSWorkspace.shared.runningApplications
                 .first(where: { $0.bundleIdentifier == ghosttyBundleId }) else { return }
 
-        let folderName = (projectPath as NSString).lastPathComponent
-
-        // Strategy 1: TTY → process-tree tab index → Cmd+<number> keyboard shortcut
-        // Uses keyboard shortcuts (Cmd+1, Cmd+2, ...) which target visual tab position,
-        // immune to Window menu MRU reordering that caused reversed navigation.
-        if let tty,
-           let tabIndex = findGhosttyTabIndex(ghosttyPid: app.processIdentifier, tty: tty),
+        // Strategy 1: TTY → process-tree tab index → Cmd+<number> via key code
+        // Prefer ghosttyTTY (outer Ghostty TTY) over tty (may be inner tmux PTY)
+        let outerTTY = (ghosttyTTY?.isEmpty == false) ? ghosttyTTY : tty
+        if let outer = outerTTY, !outer.isEmpty,
+           let tabIndex = findGhosttyTabIndex(ghosttyPid: app.processIdentifier, tty: outer),
            tabIndex >= 1 && tabIndex <= 9 {
-            app.activate(options: .activateIgnoringOtherApps)
+            let keyCodes = [0, 18, 19, 20, 21, 23, 22, 26, 28, 25]
             let script = """
+            tell application "Ghostty" to activate
+            delay 0.15
             tell application "System Events"
-                tell process "Ghostty"
-                    keystroke "\(tabIndex)" using command down
-                end tell
+                key code \(keyCodes[tabIndex]) using command down
             end tell
             """
             var error: NSDictionary?
@@ -194,36 +320,8 @@ enum TerminalFocus {
             if error == nil { return }
         }
 
-        // Strategy 2: AXWindows — each native macOS tab is a separate AXWindow.
-        // Match by AXDocument (CWD file URL) or window title containing the folder name.
-        let pid = app.processIdentifier
-        let axApp = AXUIElementCreateApplication(pid)
-        var windowsRef: CFTypeRef?
-        if AXUIElementCopyAttributeValue(axApp, "AXWindows" as CFString, &windowsRef) == .success,
-           let windows = windowsRef as? [AXUIElement], !windows.isEmpty {
-            var best: AXUIElement? = nil
-            for win in windows {
-                var docRef: CFTypeRef?
-                if AXUIElementCopyAttributeValue(win, "AXDocument" as CFString, &docRef) == .success,
-                   let doc = docRef as? String,
-                   doc.contains(projectPath) || doc.contains(folderName) {
-                    best = win; break
-                }
-                var titleRef: CFTypeRef?
-                if AXUIElementCopyAttributeValue(win, "AXTitle" as CFString, &titleRef) == .success,
-                   let title = titleRef as? String, title.contains(folderName) {
-                    best = win
-                }
-            }
-            if let target = best {
-                AXUIElementPerformAction(target, "AXRaise" as CFString)
-                app.activate(options: .activateIgnoringOtherApps)
-                return
-            }
-        }
-
-        // Fallback: just activate Ghostty
-        app.activate(options: .activateIgnoringOtherApps)
+        // Strategy 2: Write-then-click via deps injection
+        focusGhosttyWithDeps(GhosttyFocusDeps.real(), ghosttyTTY: outerTTY ?? "", projectPath: projectPath)
     }
 
     /// Find Ghostty tab index for a given TTY.

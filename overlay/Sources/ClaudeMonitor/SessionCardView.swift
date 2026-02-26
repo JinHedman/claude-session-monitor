@@ -90,7 +90,8 @@ struct SessionCardView: View {
                             projectPath: session.project_path,
                             sessionId: session.session_id,
                             transcriptPath: session.transcript_path,
-                            tty: session.tty
+                            tty: session.tty,
+                            ghosttyTTY: session.ghostty_tty
                         )
                     }
 
@@ -128,7 +129,8 @@ struct SessionCardView: View {
                     projectPath: session.project_path,
                     sessionId: session.session_id,
                     transcriptPath: session.transcript_path,
-                    tty: session.tty
+                    tty: session.tty,
+                    ghosttyTTY: session.ghostty_tty
                 )
             }
         }

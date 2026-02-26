@@ -11,6 +11,7 @@ private struct ManagedSession {
     var transcriptPath: String
     var userPrompt: String      // first user prompt (used as display title)
     var tty: String
+    var ghosttyTTY: String
     var createdAt: Date
     var updatedAt: Date
     var agents: [String: ManagedAgent]  // keyed by agent_id (fallback agent_name)
@@ -115,11 +116,20 @@ final class SessionStore: ObservableObject {
     private func checkStaleSessions() {
         let now = Date()
         let sessionStaleThreshold: TimeInterval = 30
-        let agentStaleThreshold: TimeInterval = 120   // 2 min — agents that missed their Stop
-        let agentRemoveThreshold: TimeInterval = 15    // remove completed agents after 15s
+        let sessionRemoveThreshold: TimeInterval = 300  // 5 min idle → remove from overlay + delete file
+        let agentStaleThreshold: TimeInterval = 120     // 2 min — agents that missed their Stop
+        let agentRemoveThreshold: TimeInterval = 15     // remove completed agents after 15s
         var changed = false
+        var sessionsToRemove: [String] = []
 
         for (sessionId, var session) in managedSessions {
+            // Auto-remove sessions idle for 5+ minutes (SessionEnd never fired)
+            if session.status == .idle,
+               now.timeIntervalSince(session.updatedAt) > sessionRemoveThreshold {
+                sessionsToRemove.append(sessionId)
+                continue
+            }
+
             if session.status == .active,
                now.timeIntervalSince(session.updatedAt) > sessionStaleThreshold {
                 session.status = .idle
@@ -146,6 +156,32 @@ final class SessionStore: ObservableObject {
                 session.agents.removeValue(forKey: key)
                 managedSessions[sessionId] = session
                 changed = true
+            }
+        }
+
+        // Remove dead sessions and their files
+        for sessionId in sessionsToRemove {
+            managedSessions.removeValue(forKey: sessionId)
+            fileHashes.removeValue(forKey: sessionId)
+            // Delete the stale session file
+            let file = sessionsDir.appendingPathComponent("\(sessionId).json")
+            try? FileManager.default.removeItem(at: file)
+            // Clean up lock file too
+            let lock = sessionsDir.appendingPathComponent("\(sessionId).json.lock")
+            try? FileManager.default.removeItem(at: lock)
+            changed = true
+        }
+
+        // Periodic cleanup: remove orphaned .lock files (no matching .json)
+        if let files = try? FileManager.default.contentsOfDirectory(at: sessionsDir,
+                                                                     includingPropertiesForKeys: nil) {
+            let jsonIds = Set(files.filter { $0.pathExtension == "json" }
+                .map { $0.deletingPathExtension().lastPathComponent })
+            for file in files where file.pathExtension == "lock" {
+                let lockBase = file.lastPathComponent.replacingOccurrences(of: ".json.lock", with: "")
+                if !jsonIds.contains(lockBase) {
+                    try? FileManager.default.removeItem(at: file)
+                }
             }
         }
 
@@ -213,6 +249,9 @@ final class SessionStore: ObservableObject {
                 if !event.tty.isEmpty {
                     existing.tty = event.tty
                 }
+                if !event.ghostty_tty.isEmpty {
+                    existing.ghosttyTTY = event.ghostty_tty
+                }
                 existing.status = newStatus
                 existing.updatedAt = now
 
@@ -233,6 +272,7 @@ final class SessionStore: ObservableObject {
                     transcriptPath: event.transcript_path,
                     userPrompt: event.user_prompt,
                     tty: event.tty,
+                    ghosttyTTY: event.ghostty_tty,
                     createdAt: now,
                     updatedAt: now,
                     agents: [:]
@@ -342,7 +382,8 @@ final class SessionStore: ObservableObject {
                         },
                     transcript_path: managed.transcriptPath,
                     user_prompt: managed.userPrompt,
-                    tty: managed.tty
+                    tty: managed.tty,
+                    ghostty_tty: managed.ghosttyTTY
                 )
             }
     }

@@ -1,4 +1,5 @@
 import AppKit
+import ClaudeMonitorLib
 
 // Single-instance guard: exit if another ClaudeMonitor is already running.
 // Match by bundle identifier (when running as .app) or executable name (bare binary).

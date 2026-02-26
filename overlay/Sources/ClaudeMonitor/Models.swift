@@ -36,6 +36,7 @@ struct HookEvent: Codable {
     let is_permission: Bool
     let is_interrupt: Bool
     let tty: String
+    let ghostty_tty: String
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -61,6 +62,7 @@ struct HookEvent: Codable {
         is_permission = (try? c.decode(Bool.self, forKey: .is_permission)) ?? false
         is_interrupt = (try? c.decode(Bool.self, forKey: .is_interrupt)) ?? false
         tty = (try? c.decode(String.self, forKey: .tty)) ?? ""
+        ghostty_tty = (try? c.decode(String.self, forKey: .ghostty_tty)) ?? ""
         agents = (try? c.decode([String: AgentEntry].self, forKey: .agents)) ?? [:]
     }
 
@@ -70,7 +72,7 @@ struct HookEvent: Codable {
         case session_id, hook_event_name, timestamp, cwd, notification_type,
              message, tool_name, tool_input, agent_name, agent_id, agent_type,
              transcript_path, user_prompt, reason, is_permission, is_interrupt, tty,
-             agents
+             ghostty_tty, agents
     }
 }
 
@@ -123,4 +125,5 @@ struct Session: Identifiable {
     let transcript_path: String
     let user_prompt: String
     let tty: String
+    let ghostty_tty: String
 }

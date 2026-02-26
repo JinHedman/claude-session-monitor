@@ -5,9 +5,22 @@ let package = Package(
     name: "ClaudeMonitor",
     platforms: [.macOS(.v13)],
     targets: [
+        // Library: all app logic — importable by tests
+        .target(
+            name: "ClaudeMonitorLib",
+            path: "Sources/ClaudeMonitor"
+        ),
+        // Executable: thin entry point only
         .executableTarget(
             name: "ClaudeMonitor",
-            path: "Sources/ClaudeMonitor"
+            dependencies: ["ClaudeMonitorLib"],
+            path: "Sources/ClaudeMonitorMain"
+        ),
+        // Tests
+        .testTarget(
+            name: "ClaudeMonitorTests",
+            dependencies: ["ClaudeMonitorLib"],
+            path: "Tests/ClaudeMonitorTests"
         )
     ]
 )

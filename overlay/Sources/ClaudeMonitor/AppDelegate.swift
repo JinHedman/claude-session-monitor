@@ -2,15 +2,19 @@ import AppKit
 import Combine
 import SwiftUI
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+public final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var statusItem: NSStatusItem!
     private var overlayWindowController: OverlayWindowController?
     private var cancellables = Set<AnyCancellable>()
 
+    public override init() {
+        super.init()
+    }
+
     // MARK: - Lifecycle
 
-    func applicationDidFinishLaunching(_ notification: Notification) {
+    public func applicationDidFinishLaunching(_ notification: Notification) {
         Task { @MainActor in
             self.setupStatusItem()
             self.setupOverlayWindow()
